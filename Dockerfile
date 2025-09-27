@@ -1,10 +1,9 @@
 # Use a Debian-based Python image
 FROM python:3.8
 
-# Make Python logs unbuffered (always flush stdout/stderr)
 ENV PYTHONUNBUFFERED=1
 
-# 1. INSTALL SYSTEM DEPENDENCIES
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
@@ -18,10 +17,9 @@ RUN apt-get update && apt-get install -y \
     python3-setuptools \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory for building
 WORKDIR /usr/src/build
 
-# 2. BUILD AND INSTALL PBC LIBRARY
+# Build and install PBC
 RUN wget https://crypto.stanford.edu/pbc/files/pbc-0.5.14.tar.gz && \
     tar -xvf pbc-0.5.14.tar.gz && \
     cd pbc-0.5.14 && \
@@ -30,7 +28,7 @@ RUN wget https://crypto.stanford.edu/pbc/files/pbc-0.5.14.tar.gz && \
     make install && \
     ldconfig
 
-# 3. BUILD AND INSTALL CHARM FROM SOURCE
+# Build and install Charm Crypto
 WORKDIR /usr/src/build
 RUN git clone https://github.com/JHUISI/charm.git && \
     cd charm && \
@@ -39,14 +37,14 @@ RUN git clone https://github.com/JHUISI/charm.git && \
     make install && \
     ldconfig
 
-# 4. Set the final working directory for our application
+# Final application stage
 WORKDIR /usr/src/app
-
-# Copy application code
 COPY src ./src
+COPY tests ./tests
 
-# Ensure Python finds ./src as a package
-ENV PYTHONPATH=/usr/src/app
+ENV PYTHONPATH=/usr/src/app \
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 
-# Run main script
+RUN pip install --no-cache-dir 'typing-extensions<4.5' 'pytest<8'
+
 CMD ["python", "-u", "-m", "src.main"]

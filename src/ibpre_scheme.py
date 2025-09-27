@@ -1,13 +1,17 @@
 from charm.toolbox.pairinggroup import PairingGroup, ZR, G1, GT, pair
-from charm.core.math.integer import integer, int2Bytes
 from charm.core.engine.util import objectToBytes
 import hashlib
+import base64
+
+
+def _b64(element, group):
+    return base64.b64encode(objectToBytes(element, group)).decode('ascii')
 
 class CollusionResistantIBPRE:
     def __init__(self, group_obj: PairingGroup):
         self.group = group_obj
-        self.n = self.group.messageSize()  # Length of messages in bits
-        self.message_space = 1 << self.n
+        if hasattr(self.group, 'securityLevel') and self.group.securityLevel() < 128:
+            raise ValueError("Selected pairing curve does not meet 128-bit security")
 
     def setup(self):
         g = self.group.random(G1)
@@ -20,21 +24,31 @@ class CollusionResistantIBPRE:
             'g': g, 'h': h_val, 'g1': g1, 'h1': h_val ** s,
             'Ppub1': g1, 'Ppub2': Ppub2, 'e': pair,
             'H1': lambda x: self.group.hash(x.encode('utf-8'), G1),
-            'H2': lambda x, y: self.group.hash((x, y), ZR),
-            'H3': lambda x: self._hash_to_n_bits(x, self.n),
+            'H2': lambda sigma, msg_bytes: self.group.hash((sigma, msg_bytes), ZR),
+            'H3': lambda sigma, length: self._hash_bytes(sigma, length),
             'H4': lambda x: self.group.hash(x.encode('utf-8'), G1),
             'H5': lambda args: self.group.hash(args, ZR)
         }
         return (s, params)
 
-    def _hash_to_n_bits(self, element, n):
-        element_bytes = objectToBytes(element, self.group)
-        hash_obj = hashlib.sha256(element_bytes)
-        # Reduce the hash to n bits
-        return int.from_bytes(hash_obj.digest(), byteorder='big') % (1 << n)
+    def _hash_bytes(self, element, output_len):
+        material = objectToBytes(element, self.group)
+        digest = b''
+        counter = 0
+        while len(digest) < output_len:
+            counter_bytes = counter.to_bytes(4, 'big')
+            digest += hashlib.sha256(material + counter_bytes).digest()
+            counter += 1
+        return digest[:output_len]
 
-    def _int_to_bytes(self, value, length):
-        return value.to_bytes((length + 7) // 8, byteorder='big')
+    @staticmethod
+    def _xor_bytes(a: bytes, b: bytes) -> bytes:
+        return bytes(x ^ y for x, y in zip(a, b))
+
+    def _hash_input(self, identity, C1, C2, C3, C4):
+        parts = [identity, _b64(C1, self.group), _b64(C2, self.group),
+                 _b64(C3, self.group), C4.hex()]
+        return "||".join(parts)
 
     def keyGen(self, msk, id_i, params):
         return params['H1'](id_i) ** msk
@@ -51,21 +65,21 @@ class CollusionResistantIBPRE:
         return {'RK1': RK1, 'RK2': RK2, 'RK3': RK3, 'e1': e1, 'xij': xij}
 
     def encrypt(self, m, id_i, params):
-        enc_m = int.from_bytes(m.encode('utf-8'), byteorder='big')
-        if not (0 <= enc_m < self.message_space):
-            raise ValueError("Message is out of the valid message space.")
-            
+        m_bytes = m.encode('utf-8')
+        if not m_bytes:
+            raise ValueError("Message must be non-empty")
+
         sigma = self.group.random(GT)
-        r = params['H2'](sigma, self._int_to_bytes(enc_m, self.n))
+        r = params['H2'](sigma, m_bytes)
         
         C1 = params['g'] ** r
         C2 = params['g1'] ** r
         C3 = sigma * params['e'](params['Ppub2'], params['H1'](id_i) ** r)
         
-        h3_sigma = params['H3'](sigma)
-        C4 = enc_m ^ h3_sigma
+        mask = params['H3'](sigma, len(m_bytes))
+        C4 = self._xor_bytes(m_bytes, mask)
         
-        hash_input = f"{id_i}||{C1}||{C2}||{C3}||{C4}"
+        hash_input = self._hash_input(id_i, C1, C2, C3, C4)
         C5 = params['H4'](hash_input) ** r
         
         return {'C1': C1, 'C2': C2, 'C3': C3, 'C4': C4, 'C5': C5}
@@ -73,24 +87,23 @@ class CollusionResistantIBPRE:
     def decrypt(self, C, skid_i, id_i, params):
         C1, C2, C3, C4, C5 = C['C1'], C['C2'], C['C3'], C['C4'], C['C5']
         
-        hash_input = f"{id_i}||{C1}||{C2}||{C3}||{C4}"
+        hash_input = self._hash_input(id_i, C1, C2, C3, C4)
         if params['e'](C1, params['g1']) != params['e'](params['g'], C2) or \
            params['e'](C1, params['H4'](hash_input)) != params['e'](params['g'], C5):
             return b"INVALID CIPHERTEXT"
             
         sigma = C3 / params['e'](C2, skid_i)
-        h3_sigma = params['H3'](sigma)
-        m_int = C4 ^ h3_sigma
-        m_bytes = self._int_to_bytes(m_int, self.n)
-        
+        mask = params['H3'](sigma, len(C4))
+        m_bytes = self._xor_bytes(C4, mask)
+
         if C2 != params['g1'] ** params['H2'](sigma, m_bytes):
             return b"INVALID CIPHERTEXT"
             
-        return int2Bytes(integer(m_int))
+        return m_bytes
 
     def reEncrypt(self, C, RK_i_j, id_i, params):
         C1, C2, C3, C4, C5 = C['C1'], C['C2'], C['C3'], C['C4'], C['C5']
-        hash_input = f"{id_i}||{C1}||{C2}||{C3}||{C4}"
+        hash_input = self._hash_input(id_i, C1, C2, C3, C4)
         
         if params['e'](C1, params['H4'](hash_input)) != params['e'](params['g'], C5):
             return "INVALID CIPHERTEXT"
@@ -110,11 +123,10 @@ class CollusionResistantIBPRE:
             return b"INVALID RE-ENCRYPTION KEY"
             
         sigma = D3 / params['e'](D1, D5 ** D['xij'])
-        h3_sigma = params['H3'](sigma)
-        m_int = D4 ^ h3_sigma
-        m_bytes = self._int_to_bytes(m_int, self.n)
-        
+        mask = params['H3'](sigma, len(D4))
+        m_bytes = self._xor_bytes(D4, mask)
+
         if D1 != params['g'] ** params['H2'](sigma, m_bytes):
             return b"INVALID CIPHERTEXT"
             
-        return int2Bytes(integer(m_int))
+        return m_bytes
